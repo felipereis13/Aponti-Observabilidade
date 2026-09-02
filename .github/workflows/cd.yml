@@ -45,7 +45,7 @@ jobs:
   terraform:
     name: Provisionar EC2 no LocalStack
     needs: docker
-    runs-on: self-hosted
+    runs-on: [self-hosted, Windows, X64]
     outputs:
       instance_id: ${{ steps.terraform-output.outputs.instance_id }}
 
@@ -57,20 +57,20 @@ jobs:
           clean: false
 
       - name: Iniciar LocalStack
-        shell: bash
         run: docker compose -f docker-compose.localstack.yml up -d
 
       - name: Aguardar LocalStack
-        shell: bash
         run: |
-          for attempt in {1..30}; do
-            if curl --fail --silent http://localhost:4566/_localstack/health > /dev/null; then
+          foreach ($attempt in 1..30) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri http://localhost:4566/_localstack/health | Out-Null
               exit 0
-            fi
-            echo "LocalStack ainda nao esta pronto: tentativa $attempt de 30"
-            sleep 5
-          done
-          exit 1
+            } catch {
+              Write-Output "LocalStack ainda nao esta pronto: tentativa $attempt de 30"
+              Start-Sleep -Seconds 5
+            }
+          }
+          throw "LocalStack nao iniciou corretamente."
 
       - name: Instalar Terraform
         uses: hashicorp/setup-terraform@v4
@@ -79,7 +79,6 @@ jobs:
 
       - name: Validar Terraform
         working-directory: terraform
-        shell: bash
         run: |
           terraform init
           terraform fmt -check
@@ -87,19 +86,18 @@ jobs:
 
       - name: Provisionar EC2
         working-directory: terraform
-        shell: bash
         run: terraform apply -auto-approve
 
       - name: Obter ID da EC2
         id: terraform-output
         working-directory: terraform
-        shell: bash
-        run: echo "instance_id=$(terraform output -raw instance_id)" >> "$GITHUB_OUTPUT"
+        run: |
+          "instance_id=$(terraform output -raw instance_id)" >> $env:GITHUB_OUTPUT
 
   deploy:
     name: Deploy local
     needs: [docker, terraform]
-    runs-on: self-hosted
+    runs-on: [self-hosted, Windows, X64]
     env:
       DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/observabilidade-api:${{ github.event.workflow_run.head_sha }}
       DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
@@ -113,34 +111,32 @@ jobs:
           clean: false
 
       - name: Mostrar EC2 provisionada
-        shell: bash
         run: |
-          echo "EC2 criada no LocalStack: ${{ needs.terraform.outputs.instance_id }}"
+          Write-Output "EC2 criada no LocalStack: ${{ needs.terraform.outputs.instance_id }}"
 
       - name: Preparar configuracao
-        shell: bash
         run: |
-          printf 'DOCKER_IMAGE=%s\nDATABASE_PASSWORD=%s\nGRAFANA_ADMIN_PASSWORD=%s\n' \
-            "$DOCKER_IMAGE" \
-            "$DATABASE_PASSWORD" \
-            "$GRAFANA_ADMIN_PASSWORD" > .env.production
+          @(
+            "DOCKER_IMAGE=$env:DOCKER_IMAGE"
+            "DATABASE_PASSWORD=$env:DATABASE_PASSWORD"
+            "GRAFANA_ADMIN_PASSWORD=$env:GRAFANA_ADMIN_PASSWORD"
+          ) | Set-Content -Path .env.production -Encoding ascii
 
       - name: Executar aplicacao atualizada
-        shell: bash
         run: |
           docker compose --env-file .env.production -f docker-compose.prod.yml pull
           docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans
 
       - name: Verificar deploy
-        shell: bash
         run: |
-          for attempt in {1..20}; do
-            if curl --fail --silent http://localhost:3000/health; then
-              echo
-              echo "Deploy concluido: http://localhost:3000"
-              echo "Grafana: http://localhost:3001"
+          foreach ($attempt in 1..20) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri http://localhost:3000/health | Out-Null
+              Write-Output "Deploy concluido: http://localhost:3000"
+              Write-Output "Grafana: http://localhost:3001"
               exit 0
-            fi
-            sleep 5
-          done
-          exit 1
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+          throw "A API nao respondeu depois do deploy."
