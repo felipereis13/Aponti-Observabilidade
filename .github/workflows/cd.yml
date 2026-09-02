@@ -46,6 +46,9 @@ jobs:
     name: Provisionar EC2 no LocalStack
     needs: docker
     runs-on: [self-hosted, Windows, X64]
+    defaults:
+      run:
+        shell: cmd
     outputs:
       instance_id: ${{ steps.terraform-output.outputs.instance_id }}
 
@@ -61,16 +64,17 @@ jobs:
 
       - name: Aguardar LocalStack
         run: |
-          foreach ($attempt in 1..30) {
-            try {
-              Invoke-WebRequest -UseBasicParsing -Uri http://localhost:4566/_localstack/health | Out-Null
-              exit 0
-            } catch {
-              Write-Output "LocalStack ainda nao esta pronto: tentativa $attempt de 30"
-              Start-Sleep -Seconds 5
-            }
-          }
-          throw "LocalStack nao iniciou corretamente."
+          @echo off
+          for /L %%i in (1,1,30) do (
+            curl --fail --silent http://localhost:4566/_localstack/health >nul 2>&1
+            if not errorlevel 1 goto localstack_ready
+            echo LocalStack ainda nao esta pronto: tentativa %%i de 30
+            ping 127.0.0.1 -n 6 >nul
+          )
+          echo LocalStack nao iniciou corretamente.
+          exit /b 1
+          :localstack_ready
+          echo LocalStack pronto.
 
       - name: Instalar Terraform
         uses: hashicorp/setup-terraform@v4
@@ -80,9 +84,9 @@ jobs:
       - name: Validar Terraform
         working-directory: terraform
         run: |
-          terraform init
-          terraform fmt -check
-          terraform validate
+          terraform init || exit /b 1
+          terraform fmt -check || exit /b 1
+          terraform validate || exit /b 1
 
       - name: Provisionar EC2
         working-directory: terraform
@@ -92,12 +96,17 @@ jobs:
         id: terraform-output
         working-directory: terraform
         run: |
-          "instance_id=$(terraform output -raw instance_id)" >> $env:GITHUB_OUTPUT
+          for /f "delims=" %%i in ('terraform output -raw instance_id') do set "INSTANCE_ID=%%i"
+          if not defined INSTANCE_ID exit /b 1
+          echo instance_id=%INSTANCE_ID%>>"%GITHUB_OUTPUT%"
 
   deploy:
     name: Deploy local
     needs: [docker, terraform]
     runs-on: [self-hosted, Windows, X64]
+    defaults:
+      run:
+        shell: cmd
     env:
       DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/observabilidade-api:${{ github.event.workflow_run.head_sha }}
       DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
@@ -112,31 +121,23 @@ jobs:
 
       - name: Mostrar EC2 provisionada
         run: |
-          Write-Output "EC2 criada no LocalStack: ${{ needs.terraform.outputs.instance_id }}"
-
-      - name: Preparar configuracao
-        run: |
-          @(
-            "DOCKER_IMAGE=$env:DOCKER_IMAGE"
-            "DATABASE_PASSWORD=$env:DATABASE_PASSWORD"
-            "GRAFANA_ADMIN_PASSWORD=$env:GRAFANA_ADMIN_PASSWORD"
-          ) | Set-Content -Path .env.production -Encoding ascii
+          echo EC2 criada no LocalStack: ${{ needs.terraform.outputs.instance_id }}
 
       - name: Executar aplicacao atualizada
         run: |
-          docker compose --env-file .env.production -f docker-compose.prod.yml pull
-          docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans
+          docker compose -f docker-compose.prod.yml pull || exit /b 1
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans || exit /b 1
 
       - name: Verificar deploy
         run: |
-          foreach ($attempt in 1..20) {
-            try {
-              Invoke-WebRequest -UseBasicParsing -Uri http://localhost:3000/health | Out-Null
-              Write-Output "Deploy concluido: http://localhost:3000"
-              Write-Output "Grafana: http://localhost:3001"
-              exit 0
-            } catch {
-              Start-Sleep -Seconds 5
-            }
-          }
-          throw "A API nao respondeu depois do deploy."
+          @echo off
+          for /L %%i in (1,1,20) do (
+            curl --fail --silent http://localhost:3000/health >nul 2>&1
+            if not errorlevel 1 goto deploy_ready
+            ping 127.0.0.1 -n 6 >nul
+          )
+          echo A API nao respondeu depois do deploy.
+          exit /b 1
+          :deploy_ready
+          echo Deploy concluido: http://localhost:3000
+          echo Grafana: http://localhost:3001
