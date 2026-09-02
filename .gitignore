@@ -2,5 +2,30 @@ node_modules
 dist
 coverage
 .env
+.env.production
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
 
 /generated/prisma
+
+# GitHub Actions self-hosted runner (nao enviar ao repositorio)
+/.credentials
+/.credentials_rsaparams
+/.runner
+/.runner_migrated
+/.service
+/_diag/
+/_work/
+/bin/
+/externals/
+/actions-runner-win-x64-*.zip
+/config.cmd
+/env.cmd
+/run.cmd
+/run-helper.cmd
+/run-helper.cmd.template
+/run-helper.sh.template
