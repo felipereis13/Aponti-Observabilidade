@@ -1,0 +1,146 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_REPOSITORY: observabilidade-api
+
+jobs:
+  docker:
+    name: Build e Push Docker
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar o codigo aprovado pelo CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e Push da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.event.workflow_run.head_sha }}
+
+  terraform:
+    name: Provisionar EC2 no LocalStack
+    needs: docker
+    runs-on: self-hosted
+    outputs:
+      instance_id: ${{ steps.terraform-output.outputs.instance_id }}
+
+    steps:
+      - name: Baixar o codigo aprovado pelo CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          clean: false
+
+      - name: Iniciar LocalStack
+        shell: bash
+        run: docker compose -f docker-compose.localstack.yml up -d
+
+      - name: Aguardar LocalStack
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:4566/_localstack/health > /dev/null; then
+              exit 0
+            fi
+            echo "LocalStack ainda nao esta pronto: tentativa $attempt de 30"
+            sleep 5
+          done
+          exit 1
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Validar Terraform
+        working-directory: terraform
+        shell: bash
+        run: |
+          terraform init
+          terraform fmt -check
+          terraform validate
+
+      - name: Provisionar EC2
+        working-directory: terraform
+        shell: bash
+        run: terraform apply -auto-approve
+
+      - name: Obter ID da EC2
+        id: terraform-output
+        working-directory: terraform
+        shell: bash
+        run: echo "instance_id=$(terraform output -raw instance_id)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy local
+    needs: [docker, terraform]
+    runs-on: self-hosted
+    env:
+      DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/observabilidade-api:${{ github.event.workflow_run.head_sha }}
+      DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+    steps:
+      - name: Baixar o codigo aprovado pelo CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          clean: false
+
+      - name: Mostrar EC2 provisionada
+        shell: bash
+        run: |
+          echo "EC2 criada no LocalStack: ${{ needs.terraform.outputs.instance_id }}"
+
+      - name: Preparar configuracao
+        shell: bash
+        run: |
+          printf 'DOCKER_IMAGE=%s\nDATABASE_PASSWORD=%s\nGRAFANA_ADMIN_PASSWORD=%s\n' \
+            "$DOCKER_IMAGE" \
+            "$DATABASE_PASSWORD" \
+            "$GRAFANA_ADMIN_PASSWORD" > .env.production
+
+      - name: Executar aplicacao atualizada
+        shell: bash
+        run: |
+          docker compose --env-file .env.production -f docker-compose.prod.yml pull
+          docker compose --env-file .env.production -f docker-compose.prod.yml up -d --remove-orphans
+
+      - name: Verificar deploy
+        shell: bash
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent http://localhost:3000/health; then
+              echo
+              echo "Deploy concluido: http://localhost:3000"
+              echo "Grafana: http://localhost:3001"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
